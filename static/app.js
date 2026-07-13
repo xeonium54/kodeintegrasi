@@ -1,0 +1,791 @@
+let defaultShapes = [
+  { name: "kucing", hint: "Hewan berbulu yang suka mengeong" },
+  { name: "unta",  hint: "Hewan pelintas gurun dengan punuk" },
+  { name: "rumah", hint: "Tempat kita berlindung dan tinggal" },
+  { name: "kotak", hint: "Bentuk dasar bersisi empat" },
+];
+
+let masterShapes = [];
+let gameActiveList = [];
+let gameState = [];
+let activeGameIndex = -1;
+let wrongAttempts = 0;
+let currentX = 0.0, currentY = 0.0, currentZ = 0.0, currentR = 0.0;
+
+window.onload = async () => {
+  const savedTheme = localStorage.getItem("temaHMI");
+  if (savedTheme === "dark") {
+    document.body.classList.add("dark-mode");
+    document.getElementById("darkModeBtn").innerText = "☀️";
+  }
+
+  try {
+    const res = await fetch("/api/templates?t=" + new Date().getTime());
+    const data = await res.json();
+    
+    if (data && data.length > 0) {
+      masterShapes = data;
+    } else {
+      masterShapes = JSON.parse(JSON.stringify(defaultShapes));
+    }
+  } catch (e) {
+    console.error("Gagal load templates dari database:", e);
+    masterShapes = JSON.parse(JSON.stringify(defaultShapes));
+  }
+
+  updateCoordUI();
+  renderTemplates();
+  gameActiveList = JSON.parse(JSON.stringify(masterShapes));
+  gameState = Array(gameActiveList.length).fill(false);
+  renderGameGrid();
+  installVisionRefreshButton();
+
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const host = window.location.host;
+  const wsUrl = protocol + "//" + host + "/ws/pose";
+  const ws = new WebSocket(wsUrl);
+  ws.onopen = () => console.log("STATUS: Berhasil nyambung ke WebSocket Dobot di " + wsUrl);
+  ws.onerror = (error) => console.error("ERROR: WebSocket terputus!", error);
+  ws.onmessage = (event) => {
+    try {
+      let data = JSON.parse(event.data);
+      document.getElementById("currX").innerText = data.x.toFixed(1);
+      document.getElementById("currY").innerText = data.y.toFixed(1);
+      document.getElementById("currZ").innerText = data.z.toFixed(1);
+      document.getElementById("currR").innerText = data.r.toFixed(1);
+      currentX = data.x; currentY = data.y;
+      currentZ = data.z; currentR = data.r;
+    } catch (e) {
+      console.error("Gagal mengolah data live:", e);
+    }
+  };
+};
+
+function updateCoordUI() {
+  document.getElementById("currX").innerText = currentX.toFixed(1);
+  document.getElementById("currY").innerText = currentY.toFixed(1);
+  document.getElementById("currZ").innerText = currentZ.toFixed(1);
+  document.getElementById("currR").innerText = currentR.toFixed(1);
+}
+
+const VISION_RESET_COOLDOWN_MS = 15000;
+
+async function refreshVisionStream(button) {
+  const oldText = button?.innerText;
+  if (button) {
+    button.disabled = true;
+    button.innerText = "Refreshing...";
+  }
+  await fetch("/monitor/reset-camera", { method: "POST" }).catch(() => {});
+  const img = document.querySelector("#visionPage img");
+  if (img) img.src = "/monitor/stream/overview.mjpg?size=540p&t=" + Date.now();
+  if (button) {
+    button.innerText = "Tunggu 15s";
+    setTimeout(() => {
+      button.disabled = false;
+      button.innerText = oldText;
+    }, VISION_RESET_COOLDOWN_MS);
+  }
+}
+
+async function recordVisionPosition(button) {
+  const oldText = button.innerText;
+  button.disabled = true;
+  button.innerText = "Recording...";
+  try {
+    const res = await fetch("/monitor/record", { method: "POST" });
+    const payload = await res.json();
+    if (!res.ok) throw new Error(payload?.detail?.error || payload?.detail?.reason || payload?.error || res.statusText);
+    button.innerText = "Saved " + (payload.recorded_count || 0);
+  } catch (e) {
+    button.innerText = "Record gagal";
+    console.error(e);
+  } finally {
+    setTimeout(() => {
+      button.disabled = false;
+      button.innerText = oldText;
+    }, 1800);
+  }
+}
+
+function installVisionRefreshButton() {
+  const controls = document.querySelector("#visionPage .card div[style*='display:flex']");
+  if (!controls || document.getElementById("refreshVisionBtn")) return;
+  const recordBtn = document.createElement("button");
+  recordBtn.id = "recordVisionBtn";
+  recordBtn.className = "btn";
+  recordBtn.style.flex = "1";
+  recordBtn.innerText = "Record Posisi";
+  recordBtn.onclick = () => recordVisionPosition(recordBtn);
+
+  const btn = document.createElement("button");
+  btn.id = "refreshVisionBtn";
+  btn.className = "btn";
+  btn.style.flex = "1";
+  btn.innerText = "Refresh Kamera";
+  btn.onclick = () => refreshVisionStream(btn);
+  controls.insertBefore(btn, controls.firstChild);
+  controls.insertBefore(recordBtn, controls.firstChild);
+}
+
+function toggleDarkMode() {
+  document.body.classList.toggle("dark-mode");
+  const isDark = document.body.classList.contains("dark-mode");
+  localStorage.setItem("temaHMI", isDark ? "dark" : "light");
+  const btn = document.getElementById("darkModeBtn");
+  btn.innerText = isDark ? "◉" : "⚆";
+}
+
+function togglePassword() {
+  const passInput = document.getElementById("passInput");
+  const eyeIcon = document.getElementById("eyeIcon");
+  if (passInput.type === "password") {
+    passInput.type = "text";
+    eyeIcon.innerText = ">_<";
+  } else {
+    passInput.type = "password";
+    eyeIcon.innerText = "O_O";
+  }
+}
+
+function showModal(title, message) {
+  document.getElementById("modalTitle").innerText = title;
+  document.getElementById("modalMessage").innerText = message;
+  document.getElementById("cuteModal").style.display = "flex";
+}
+function closeModal(modalId) {
+  document.getElementById(modalId).style.display = "none";
+}
+function ensureAdminMenu() {
+  const grid = document.querySelector("#choicePage .menu-grid");
+  if (!grid || document.getElementById("adminTemplateAdd")) return;
+  [
+    ["adminTemplateAdd", "+", "Tambah Template", "showPage('engineerSimPage')"],
+    ["adminTemplateDelete", "-", "Kurangi Template", "openDeleteModal()"],
+    ["adminActivityLog", "☰", "Activity Log", "loadActivityLogs(); showPage('activityLogPage')"],
+  ].forEach(([id, icon, label, action]) => {
+    const box = document.createElement("div");
+    box.id = id;
+    box.className = "menu-box admin-only";
+    box.setAttribute("onclick", action);
+    box.innerHTML = `${icon} <span>${label}</span>`;
+    grid.insertBefore(box, grid.lastElementChild);
+  });
+}
+
+function showPage(pageId) {
+  document.querySelectorAll(".page").forEach((p) => p.classList.remove("active"));
+  document.getElementById(pageId).classList.add("active");
+}
+
+function runTemplate(name) {
+  showModal("Yay! ✦", "Dobot sedang memproses template " + name + "... Mohon tunggu sebentar ya!");
+  fetch("/perintah", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode: "template", target_bentuk: name }),
+  }).catch((e) => console.error(e));
+}
+
+function sendManualCommand(aksi) {
+  if (aksi === "reset") {
+    currentX = 0.0; currentY = 0.0; currentZ = 0.0; currentR = 0.0;
+    updateCoordUI();
+  }
+  fetch("/perintah", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode: "manual", action: aksi }),
+  }).catch((e) => console.error(e));
+}
+
+function sendCoordinate() {
+  const x = document.getElementById("inpX").value,
+        y = document.getElementById("inpY").value,
+        z = document.getElementById("inpZ").value,
+        r = document.getElementById("inpR").value;
+  if (!x || !y || !z || !r) {
+    showModal("(╥﹏╥)", "Isi semua angka koordinatnya dulu yaa ♡");
+    return;
+  }
+  currentX = parseFloat(x); currentY = parseFloat(y);
+  currentZ = parseFloat(z); currentR = parseFloat(r);
+  updateCoordUI();
+  fetch("/perintah", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode: "koordinat", target: { x: currentX, y: currentY, z: currentZ, r: currentR } }),
+  }).catch((e) => console.error(e));
+  document.getElementById("inpX").value = "";
+  document.getElementById("inpY").value = "";
+  document.getElementById("inpZ").value = "";
+  document.getElementById("inpR").value = "";
+}
+
+let holdInterval = null;
+const JOG_STEP = 2.0;
+function applyJogDirection(aksi) {
+  switch (aksi) {
+    case "maju":       currentX += JOG_STEP; break;
+    case "mundur":     currentX -= JOG_STEP; break;
+    case "kiri":       currentY += JOG_STEP; break;
+    case "kanan":      currentY -= JOG_STEP; break;
+    case "atas":       currentZ += JOG_STEP; break;
+    case "bawah":      currentZ -= JOG_STEP; break;
+    case "rotate_cw":  currentR -= JOG_STEP; break;
+    case "rotate_ccw": currentR += JOG_STEP; break;
+  }
+}
+function startHold(aksi) {
+  if (holdInterval) clearInterval(holdInterval);
+  sendManualCommand(aksi);
+  applyJogDirection(aksi);
+  holdInterval = setInterval(() => {
+    sendManualCommand(aksi);
+    applyJogDirection(aksi);
+  }, 200);
+}
+function stopHold() {
+  if (holdInterval) {
+    clearInterval(holdInterval);
+    holdInterval = null;
+    sendManualCommand("stop");
+  }
+}
+
+function validateDualLogin() {
+  const user = document.getElementById("userInput").value,
+        pass = document.getElementById("passInput").value;
+  const isDark = document.body.classList.contains("dark-mode");
+  if (user === "user" && pass === "123") {
+    document.body.className = isDark ? "dark-mode theme-coquette" : "theme-coquette";
+    showPage("choicePage");
+  } else if (user === "admin" && pass === "admin") {
+    document.body.className = isDark ? "dark-mode theme-coquette admin-mode" : "theme-coquette admin-mode";
+    ensureAdminMenu();
+    showPage("choicePage");
+  } else {
+    showModal("(╥﹏╥)", "Salah nih username atau password-nya! Coba dicek lagi yaa ♡");
+  }
+}
+function logout() {
+  document.getElementById("userInput").value = "";
+  document.getElementById("passInput").value = "";
+  const isDark = document.body.classList.contains("dark-mode");
+  document.body.className = isDark ? "dark-mode theme-coquette" : "theme-coquette";
+  showPage("loginPage");
+}
+
+function renderTemplates() {
+  const container = document.getElementById("templateGridContainer");
+  if (!container) return;
+  container.innerHTML = "";
+  masterShapes.forEach((item) => {
+    let box = document.createElement("div");
+    box.className = "menu-box";
+    box.innerHTML = `✨ <span>${item.name}</span>`;
+    box.onclick = () => runTemplate(item.name);
+    container.appendChild(box);
+  });
+}
+
+function shuffleArray(array) {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+}
+
+function acakFisikDobot() {
+  document.getElementById("loadingIcon").innerText = "🌪️";
+  document.getElementById("loadingText").innerText = "Dobot sedang mengacak kepingan di meja...";
+  document.getElementById("loadingModal").style.display = "flex";
+  fetch("/perintah", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode: "manual", action: "acak_kepingan" }),
+  }).catch((e) => console.error(e));
+  setTimeout(() => {
+    document.getElementById("loadingModal").style.display = "none";
+    showModal("Selesai ✦", "Susunan fisik kepingan tangram telah diacak oleh Dobot!");
+  }, 2500);
+}
+
+function renderGameGrid() {
+  const container = document.getElementById("gameGridContainer");
+  if (!container) return;
+  container.innerHTML = "";
+  gameActiveList.forEach((item, index) => {
+    let box = document.createElement("div");
+    box.className = "menu-box";
+    if (gameState[index]) {
+      box.style.background = "var(--lace)";
+      box.innerHTML = `✅ <span>${item.name}</span>`;
+    } else {
+      box.innerHTML = `❓ <span>?</span>`;
+      box.onclick = () => startGameTask(index);
+    }
+    container.appendChild(box);
+  });
+}
+
+function startGameTask(index) {
+  if (gameState[index]) return;
+  activeGameIndex = index;
+  wrongAttempts = 0;
+
+  let shapeName = gameActiveList[index].name;
+  fetch("/perintah", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode: "template", target_bentuk: shapeName }),
+  }).catch((e) => console.error(e));
+
+  document.getElementById("loadingIcon").innerText = "🤖";
+  document.getElementById("loadingText").innerText = "Dobot sedang menggambar rahasia...";
+  document.getElementById("loadingModal").style.display = "flex";
+
+  setTimeout(() => {
+    document.getElementById("loadingModal").style.display = "none";
+    document.getElementById("gameHint").innerText = "";
+    document.getElementById("gameInput").value = "";
+    document.getElementById("gameModal").style.display = "flex";
+    document.getElementById("gameInput").focus();
+  }, 2000);
+}
+
+function submitGameGuess() {
+  let input = document.getElementById("gameInput").value.trim().toLowerCase();
+  let correctAns = gameActiveList[activeGameIndex].name.toLowerCase();
+
+  if (input === correctAns) {
+    document.getElementById("gameModal").style.display = "none";
+    gameState[activeGameIndex] = true;
+    renderGameGrid();
+
+    const allCleared = gameState.every((status) => status === true);
+    if (allCleared) {
+      showModal("Selamat! 🎉", "Luar biasa! Semua bentuk telah berhasil ditebak. Permainan akan diacak kembali!");
+      setTimeout(() => {
+        gameActiveList = JSON.parse(JSON.stringify(masterShapes));
+        shuffleArray(gameActiveList);
+        gameState = Array(gameActiveList.length).fill(false);
+        renderGameGrid();
+      }, 2500);
+    } else {
+      showModal("Yaaay! ✦", `Tebakan yang sempurna! Jawabannya memang ${gameActiveList[activeGameIndex].name}.`);
+    }
+  } else {
+    wrongAttempts++;
+    document.getElementById("gameInput").value = "";
+    if (wrongAttempts >= 3) {
+      document.getElementById("gameHint").innerText = "Hint: " + gameActiveList[activeGameIndex].hint;
+    }
+    let titleElem = document.getElementById("gameTitle");
+    titleElem.innerText = "Salah, coba lagi!";
+    titleElem.style.color = "#ef4444";
+    setTimeout(() => {
+      titleElem.innerText = "Tebak Bentuk!";
+      titleElem.style.color = "var(--pink-deep)";
+    }, 1500);
+  }
+}
+
+// =========================================================================
+// LOGIKA MATEMATIKA CENTER OF MASS (COM) TANGRAM
+// =========================================================================
+function getTrueCOM(piece) {
+  let bboxCenterX = piece.offsetLeft + (piece.offsetWidth / 2);
+  let bboxCenterY = piece.offsetTop + (piece.offsetHeight / 2);
+
+  let rot = parseInt(piece.getAttribute("data-rot") || "0");
+  let rad = rot * Math.PI / 180.0;
+
+  let offsetX = 0;
+  let offsetY = 0;
+
+  if (piece.classList.contains("shape-big-tri-1") || piece.classList.contains("shape-big-tri-2") ||
+      piece.classList.contains("shape-med-tri") || 
+      piece.classList.contains("shape-small-tri-1") || piece.classList.contains("shape-small-tri-2")) {
+    offsetX = -piece.offsetWidth / 6;
+    offsetY = -piece.offsetHeight / 6;
+  }
+
+  let trueX = bboxCenterX + (offsetX * Math.cos(rad) - offsetY * Math.sin(rad));
+  let trueY = bboxCenterY + (offsetX * Math.sin(rad) + offsetY * Math.cos(rad));
+
+  let dot = piece.querySelector('.com-dot');
+  if (!dot) {
+      dot = document.createElement('div');
+      dot.className = 'com-dot';
+      dot.style.position = 'absolute';
+      dot.style.width = '8px';
+      dot.style.height = '8px';
+      dot.style.background = '#2c3e50';
+      dot.style.border = '2px solid white';
+      dot.style.borderRadius = '50%';
+      dot.style.transform = 'translate(-50%, -50%)';
+      dot.style.zIndex = '999';
+      dot.style.pointerEvents = 'none'; 
+      piece.appendChild(dot);
+  }
+  dot.style.left = (piece.offsetWidth / 2 + offsetX) + 'px';
+  dot.style.top = (piece.offsetHeight / 2 + offsetY) + 'px';
+
+  return { x: trueX, y: trueY };
+}
+
+
+const simWorkspace = document.getElementById("simWorkspace");
+const tangramPieces = document.querySelectorAll(".tangram-piece");
+let draggedPiece = null, isDragging = false, startX, startY, initialLeft, initialTop;
+
+function hitungTitikBeratDobot(piece) {
+  const baseArea = document.getElementById("simBaseArea");
+  if(!baseArea) return;
+
+  const baseWidth = baseArea.offsetWidth;
+  const baseHeight = baseArea.offsetHeight;
+
+  const com = getTrueCOM(piece);
+
+  let dobotY = -267.0 + (com.x / baseWidth) * (73.0 - (-267.0));
+  let dobotX = 139.9 + (com.y / baseHeight) * (322.9 - 139.9);
+
+  // === PENAMPILAN SUDUT DI UI ===
+  // Mengambil sudut mentah dari UI
+  let displayR = parseInt(piece.getAttribute("data-rot") || "0");
+  
+  // Karena user ingin melihat standar matematika di layar 
+  // (di mana CCW = Positif dan CW = Negatif), kita invert di tampilannya juga.
+  let mathR = -displayR;
+  if (mathR === -0) mathR = 0;
+
+  const disp = document.getElementById("simCoordDisplay");
+  if(disp) {
+     disp.innerText = `Suction - X: ${dobotX.toFixed(1)} | Y: ${dobotY.toFixed(1)} | R: ${mathR.toFixed(1)}°`;
+  }
+}
+
+if (tangramPieces) {
+  tangramPieces.forEach((piece) => {
+    piece.setAttribute("data-def-right", piece.style.right);
+    piece.setAttribute("data-def-top", piece.style.top);
+    
+    getTrueCOM(piece);
+
+    piece.addEventListener("mousedown", (e) => {
+      isDragging = false;
+      draggedPiece = piece;
+      startX = e.clientX; startY = e.clientY;
+      initialLeft = piece.offsetLeft; initialTop = piece.offsetTop;
+      tangramPieces.forEach((p) => (p.style.zIndex = 10));
+      piece.style.zIndex = 100;
+      hitungTitikBeratDobot(piece); 
+    });
+
+    document.addEventListener("mousemove", (e) => {
+      if (!draggedPiece) return;
+      let dx = e.clientX - startX, dy = e.clientY - startY;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+        isDragging = true;
+        if (draggedPiece.style.right) {
+          draggedPiece.style.left = draggedPiece.offsetLeft + "px";
+          draggedPiece.style.right = "";
+        }
+        draggedPiece.style.left = initialLeft + dx + "px";
+        draggedPiece.style.top  = initialTop  + dy + "px";
+        hitungTitikBeratDobot(draggedPiece); 
+      }
+    });
+
+    document.addEventListener("mouseup", (e) => {
+      if (!draggedPiece) return;
+      if (!isDragging) {
+        let currentRot = parseInt(draggedPiece.getAttribute("data-rot") || "0");
+
+        if (draggedPiece.classList.contains("shape-square")) {
+          currentRot = (currentRot === 0) ? 45 : 0;
+        } else {
+          currentRot += 45;
+          if (currentRot > 180) {
+            currentRot -= 360; 
+          }
+        }
+
+        draggedPiece.setAttribute("data-rot", currentRot);
+        draggedPiece.style.transform = `rotate(${currentRot}deg)`;
+        
+        hitungTitikBeratDobot(draggedPiece);
+      } else {
+        let rawLeft = Math.round(parseFloat(draggedPiece.style.left) / 5) * 5;
+        let rawTop  = Math.round(parseFloat(draggedPiece.style.top)  / 5) * 5;
+        
+        const workspaceWidth = simWorkspace.offsetWidth;
+        const workspaceHeight = simWorkspace.offsetHeight;
+        
+        if (rawLeft < 0) rawLeft = 0;
+        if (rawTop  < 0) rawTop  = 0;
+        if (rawLeft + draggedPiece.offsetWidth  > workspaceWidth)  rawLeft = workspaceWidth  - draggedPiece.offsetWidth;
+        if (rawTop  + draggedPiece.offsetHeight > workspaceHeight) rawTop  = workspaceHeight - draggedPiece.offsetHeight;
+        
+        draggedPiece.style.left = rawLeft + "px";
+        draggedPiece.style.top  = rawTop  + "px";
+        hitungTitikBeratDobot(draggedPiece); 
+      }
+      draggedPiece = null;
+    });
+  });
+}
+function resetSim() {
+  tangramPieces.forEach((p) => {
+    p.setAttribute("data-rot", "0");
+    p.style.transform = "rotate(0deg)";
+    
+    p.style.left  = "";
+    p.style.right = p.getAttribute("data-def-right");
+    p.style.top   = p.getAttribute("data-def-top");
+    
+    getTrueCOM(p);
+  });
+  
+  const disp = document.getElementById("simCoordDisplay");
+  if(disp) disp.innerText = "Titik Suction Dobot: Klik kepingan untuk melihat";
+}
+
+function openNamingModal() {
+  const workspaceWidth = simWorkspace.offsetWidth;
+  const boundary = workspaceWidth * 0.7;
+  let piecesInBase = [];
+  
+  tangramPieces.forEach((p) => {
+    if (p.offsetLeft < boundary) piecesInBase.push(p);
+  });
+  
+  if (piecesInBase.length === 0) {
+    showModal("Ups! 🚧", "Tidak ada bentuk di area Alas! Tarik kepingan ke dalam alas terlebih dahulu.");
+    return;
+  }
+  document.getElementById("simShapeName").value = "";
+  document.getElementById("simShapeHint").value = "";
+  document.getElementById("engineerNamingModal").style.display = "flex";
+}
+
+function finalizeSimulation() {
+  const shapeName = document.getElementById("simShapeName").value.trim();
+  const shapeHint = document.getElementById("simShapeHint").value.trim();
+  if (!shapeName || !shapeHint) {
+    alert("Nama bentuk dan Hint WAJIB diisi untuk disimpan ke sistem!");
+    return;
+  }
+  document.getElementById("engineerNamingModal").style.display = "none";
+  document.getElementById("loadingIcon").innerText = "⚙️";
+  document.getElementById("loadingText").innerText = `Menyimpan bentuk ${shapeName} ke database...`;
+  document.getElementById("loadingModal").style.display = "flex";
+
+  const workspaceWidth = simWorkspace.offsetWidth;
+  const boundary = workspaceWidth * 0.7;
+  let piecesInBase = [];
+  tangramPieces.forEach((p) => {
+    if (p.offsetLeft < boundary) piecesInBase.push(p);
+  });
+
+  let extractedBlocks = [];
+  const baseArea = document.getElementById("simBaseArea");
+  const baseWidth = baseArea.offsetWidth;
+  const baseHeight = baseArea.offsetHeight;
+
+  piecesInBase.forEach((p) => {
+    const com = getTrueCOM(p);
+
+    let dobotY = -267.0 + (com.x / baseWidth) * (73.0 - (-267.0));
+    let dobotX = 139.9 + (com.y / baseHeight) * (322.9 - 139.9);
+
+    let r_screen  = parseInt(p.getAttribute("data-rot") || "0");
+    
+    let blockName = "UNKNOWN";
+    if (p.classList.contains("shape-big-tri-1")) blockName = "BT1";
+    else if (p.classList.contains("shape-big-tri-2")) blockName = "BT2";
+    else if (p.classList.contains("shape-med-tri")) blockName = "MT";
+    else if (p.classList.contains("shape-square")) blockName = "SQ";
+    else if (p.classList.contains("shape-small-tri-1")) blockName = "ST1";
+    else if (p.classList.contains("shape-small-tri-2")) blockName = "ST2";
+    else if (p.classList.contains("shape-para")) blockName = "PL";
+    
+    // Penyesuaian Offset spesifik bentuk PL (Jajar Genjang)
+    if (blockName === "PL") {
+      r_screen += 45;
+    }
+
+    // Normalisasi sudut agar selalu di rentang -180 hingga 180
+    while (r_screen > 180) r_screen -= 360;
+    while (r_screen <= -180) r_screen += 360;
+
+    // ----------------------------------------------------------------------
+    // [MODIFIKASI KINEMATIKA: PENYESUAIAN ARAH ROTASI R / THETA]
+    // ----------------------------------------------------------------------
+    // Di layar web (CSS), sudut positif memutar benda Searah Jarum Jam (CW).
+    // Tapi standar matematika & lengan Dobot menganggap Positif adalah Berlawanan Arah (CCW).
+    // Maka, kita harus meng-invert (mengali dengan -1) sudut layar tersebut 
+    // tepat sebelum dikirim ke Python agar sesuai dengan kemauanmu 
+    // yaitu: "CCW akan dianggap positif.. dan CW jadi negatif".
+    // ----------------------------------------------------------------------
+    let r_robot = -r_screen;
+    if (r_robot === -0) r_robot = 0; // Membersihkan "minus nol" yang aneh dari JS
+
+    extractedBlocks.push({ 
+      block_name: blockName, 
+      x: parseFloat(dobotX.toFixed(2)), 
+      y: parseFloat(dobotY.toFixed(2)), 
+      r: r_robot // <-- Menggunakan hasil yang sudah di-invert!
+    });
+  });
+  
+  setTimeout(() => {
+    document.getElementById("loadingIcon").innerText = "✅";
+    document.getElementById("loadingText").innerText = "Selesai! Bentuk disimpan ke sistem.";
+
+    masterShapes.push({ name: shapeName, hint: shapeHint });
+    renderTemplates();
+
+    gameActiveList.push({ name: shapeName, hint: shapeHint });
+    gameState.push(false);
+    renderGameGrid();
+
+    fetch("/perintah", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        mode: "database", action: "tambah_bentuk",
+        shape_name: shapeName, hint: shapeHint, blocks: extractedBlocks
+      }),
+    }).catch((e) => console.error(e));
+
+    setTimeout(() => {
+      document.getElementById("loadingModal").style.display = "none";
+      resetSim();
+      showPage("choicePage");
+    }, 2000);
+  }, 1500);
+}
+
+function openDeleteModal() {
+  const container = document.getElementById("deleteListContainer");
+  container.innerHTML = "";
+  masterShapes.forEach((shape, index) => {
+    let div = document.createElement("div");
+    div.className = "delete-list-item";
+    div.innerHTML = `<span>${shape.name}</span><button onclick="removeShape(${index})" class="btn btn-danger">Hapus</button>`;
+    container.appendChild(div);
+  });
+  document.getElementById("engineerDeleteModal").style.display = "flex";
+}
+
+function removeShape(index) {
+  const targetName = masterShapes[index].name;
+  masterShapes.splice(index, 1);
+
+  const nameDeleted = gameActiveList[index]?.name;
+  if (nameDeleted) {
+    const idxG = gameActiveList.findIndex((g) => g.name === nameDeleted);
+    if (idxG !== -1) { gameActiveList.splice(idxG, 1); gameState.splice(idxG, 1); }
+  }
+
+  fetch("/perintah", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode: "database", action: "hapus_bentuk", shape_name: targetName }),
+  }).catch((e) => console.error(e));
+
+  openDeleteModal();
+  renderTemplates();
+  renderGameGrid();
+}
+
+// =========================================================================
+// ACTIVITY LOG PAGE
+// =========================================================================
+let currentLogTab = "hmi";
+let logData = { hmi_logs: [], system_logs: [], production_logs: [] };
+
+function switchLogTab(tab) {
+  currentLogTab = tab;
+  document.querySelectorAll(".log-tab").forEach((t) => t.classList.remove("active"));
+  const tabs = document.querySelectorAll(".log-tab");
+  tabs.forEach((t) => {
+    if (
+      (tab === "hmi" && t.textContent.includes("HMI")) ||
+      (tab === "system" && t.textContent.includes("System")) ||
+      (tab === "production" && t.textContent.includes("Production"))
+    ) {
+      t.classList.add("active");
+    }
+  });
+  renderLogEntries();
+}
+
+function renderLogEntries() {
+  const container = document.getElementById("logContainer");
+  if (!container) return;
+
+  const logs = logData[currentLogTab + "_logs"] || [];
+  if (logs.length === 0) {
+    container.innerHTML = '<div class="log-empty">Tidak ada data log</div>';
+    return;
+  }
+
+  let html = "";
+  if (currentLogTab === "hmi") {
+    logs.forEach((r) => {
+      html += `<div class="log-entry">
+        <span class="log-ts">${r.timestamp || "-"}</span>
+        <span class="log-badge log-badge-action">${r.operator_id || "-"}</span>
+        <span class="log-msg">${r.action || "-"}</span>
+      </div>`;
+    });
+  } else if (currentLogTab === "system") {
+    logs.forEach((r) => {
+      const badgeClass = r.event_type === "ERROR" ? "log-badge-error" : r.event_type === "WARNING" ? "log-badge-warn" : "log-badge-info";
+      html += `<div class="log-entry">
+        <span class="log-ts">${r.timestamp || "-"}</span>
+        <span class="log-badge ${badgeClass}">${r.event_type || "-"}</span>
+        <span class="log-msg"><b>${r.component || ""}</b> ${r.message || ""}</span>
+      </div>`;
+    });
+  } else if (currentLogTab === "production") {
+    logs.forEach((r) => {
+      const badgeClass = r.status === "SUCCESS" ? "log-badge-info" : "log-badge-error";
+      const dur = r.duration_sec != null ? r.duration_sec.toFixed(1) + "s" : "-";
+      html += `<div class="log-entry">
+        <span class="log-ts">${r.start_time || "-"}</span>
+        <span class="log-badge ${badgeClass}">${r.status || "-"}</span>
+        <span class="log-msg">${r.shape_name || "-"} (${dur})</span>
+      </div>`;
+    });
+  }
+
+  container.innerHTML = html;
+}
+
+async function loadActivityLogs() {
+  const container = document.getElementById("logContainer");
+  if (container) container.innerHTML = '<div class="log-empty">Memuat data...</div>';
+
+  try {
+    const [hmi, system, production] = await Promise.all([
+      fetch("/api/logs/hmi").then((r) => r.json()),
+      fetch("/api/logs/system").then((r) => r.json()),
+      fetch("/api/logs/metrics").then((r) => r.json()),
+    ]);
+    logData = { hmi_logs: hmi, system_logs: system, production_logs: production };
+  } catch (e) {
+    console.error("Gagal load logs:", e);
+    logData = { hmi_logs: [], system_logs: [], production_logs: [] };
+  }
+
+  document.getElementById("statHmi").textContent = (logData.hmi_logs || []).length;
+  document.getElementById("statSys").textContent = (logData.system_logs || []).length;
+  document.getElementById("statProd").textContent = (logData.production_logs || []).length;
+
+  renderLogEntries();
+}

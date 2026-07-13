@@ -1,0 +1,316 @@
+"""Shared Dobot control helpers for RevPi runtime."""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple, Union
+import math
+import time
+import threading
+
+# MENGGUNAKAN PYDOBOTPLUS
+from pydobotplus import Dobot
+from pydobot.enums import PTPMode
+from pydobot.message import Message
+
+DEFAULT_PORT = "/dev/ttyUSB2"
+
+# ==========================================
+# KONFIGURASI BATAS KERJA & KECEPATAN
+# ==========================================
+X_LIMIT = (-310.0, 310.0)
+Y_LIMIT = (-310.0, 310.0)
+Z_LIMIT = (-40.0, 150.0)
+R_MIN_SAFE = 150.0
+R_MAX_SAFE = 320.0
+
+DEFAULT_SAFE_Z = 20.0
+DEFAULT_SPEED_XY = 400.0
+DEFAULT_SPEED_Z = 200.0
+
+POSE_REFRESH_DELAY_S = 0.05 
+SUCTION_SETTLE_DELAY_S = 0.1
+
+is_busy = False
+device: Optional[Dobot] = None
+
+# GEMBOK SERIAL: Mencegah tabrakan antara fungsi gerak dan telemetri MQTT
+_alat_lock = threading.RLock()
+
+# =========================================================================
+# FUNGSI KONTUR & CONSTRAINT ALJABAR
+# =========================================================================
+def get_terrain_z(x: float, y: float) -> float:
+    if 140.0 <= x <= 323.0 and -267.0 <= y <= 73.0:
+        return -18.0  
+    return -32.0      
+
+def is_path_safe(x1: float, y1: float, x2: float, y2: float, r_min: float = R_MIN_SAFE) -> bool:
+    if abs(x2 - x1) < 0.001:
+        if abs(x1) < r_min:
+            if min(y1, y2) <= 0 <= max(y1, y2): return False
+        return True
+
+    m = (y2 - y1) / (x2 - x1)
+    c = y1 - (m * x1)
+    A = 1 + m**2
+    B = 2 * m * c
+    C = (c**2) - (r_min**2)
+    D = B**2 - (4 * A * C)
+
+    if D < 0: return True 
+
+    x_tabrak_1 = (-B + math.sqrt(D)) / (2 * A)
+    x_tabrak_2 = (-B - math.sqrt(D)) / (2 * A)
+    batas_kiri = min(x1, x2)
+    batas_kanan = max(x1, x2)
+
+    if (batas_kiri <= x_tabrak_1 <= batas_kanan) or (batas_kiri <= x_tabrak_2 <= batas_kanan):
+        return False 
+    return True
+
+def _safe_error_message(x: float, y: float, z: float) -> str:
+    if not (X_LIMIT[0] <= x <= X_LIMIT[1]): return f"X diluar batas {X_LIMIT}"
+    if not (Y_LIMIT[0] <= y <= Y_LIMIT[1]): return f"Y diluar batas {Y_LIMIT}"
+    if not (Z_LIMIT[0] <= z <= Z_LIMIT[1]): return f"Z diluar batas vertikal ekstrem {Z_LIMIT}"
+        
+    radius = math.sqrt(x**2 + y**2)
+    if radius > R_MAX_SAFE or radius < R_MIN_SAFE: 
+        return f"Singularitas! Radius {radius:.1f} di luar rentang aman ({R_MIN_SAFE}-{R_MAX_SAFE} mm)"
+    return ""
+
+def is_safe(x: float, y: float, z: float) -> bool: 
+    return not _safe_error_message(float(x), float(y), float(z))
+
+# ==========================================
+# UTILITAS KONEKSI & POSE
+# ==========================================
+def _require_device() -> Dobot:
+    if device is None: raise RuntimeError("Dobot is not connected")
+    return device
+
+def is_connected() -> bool:
+    return device is not None
+
+def connect(port: str = DEFAULT_PORT) -> bool:
+    global device
+    if device is not None: return True
+    with _alat_lock:
+        try:
+            device = Dobot(port=port)
+            print(">>> Membuka Koneksi Serial Dobot...")
+            time.sleep(1.5) 
+            clear_alarms()
+            _require_device().speed(float(DEFAULT_SPEED_XY), float(DEFAULT_SPEED_Z))
+            time.sleep(0.5)
+            print(">>> Koneksi Berhasil & Dobot Siap!")
+            return True
+        except Exception as exc:
+            device = None
+            print(f"!!! Gagal koneksi Dobot: {exc}")
+            return False
+
+def disconnect() -> None:
+    global device
+    if device is None: return
+    with _alat_lock:
+        try: device.suck(False)
+        except Exception: pass
+        try: device.close()
+        finally:
+            device = None
+            print(">>> Koneksi Serial Dobot Ditutup.")
+
+def clear_alarms() -> bool:
+    try: controller = _require_device()
+    except RuntimeError: return False
+    with _alat_lock:
+        controller._set_queued_cmd_clear()
+        msg = Message()
+        msg.id = 20
+        msg.ctrl = 0x01
+        controller._send_command(msg)
+    print(">>> [MEKANIK] Alarm Direset & Antrean Gerak Dihapus! (Lampu Hijau/Biru)")
+    return True
+
+def get_current_pose() -> Tuple[float, float, float, float]:
+    with _alat_lock:
+        controller = _require_device()
+        pose = controller.get_pose() 
+        if pose is None:
+            time.sleep(0.1)
+            pose = controller.get_pose()
+            if pose is None: raise RuntimeError("Gagal mengambil data pose Dobot")
+        return float(pose.position.x), float(pose.position.y), float(pose.position.z), float(pose.position.r)
+
+def get_current_pose_payload() -> Dict[str, float]:
+    x_mm, y_mm, z_mm, r_deg = get_current_pose()
+    return {"x_mm": x_mm, "y_mm": y_mm, "z_mm": z_mm, "r_deg": r_deg}
+
+def set_suction(enabled: bool) -> None:
+    with _alat_lock:
+        controller = _require_device()
+        controller.suck(bool(enabled))
+
+def _normalize_suck_value(suck_val: Union[float, bool, int]) -> bool: 
+    return bool(float(suck_val))
+
+# =========================================================================
+# FUNGSI PERGERAKAN UTAMA (Logika Vakum Diperbaiki)
+# =========================================================================
+def move_to_absolute(target_x: float, target_y: float, target_z: Optional[float] = None, target_r: float = 0.0, suck_val: Union[float, bool, int] = 0.0, safe_z: Optional[float] = None, is_transit: bool = False) -> bool:
+    controller = _require_device()
+    target_x, target_y, target_r = float(target_x), float(target_y), float(target_r)
+    commanded_safe_z = float(DEFAULT_SAFE_Z if safe_z is None else safe_z)
+
+    if target_z is None: target_z = get_terrain_z(target_x, target_y)
+    else: target_z = float(target_z)
+
+    if not is_safe(target_x, target_y, target_z):
+        print(f"!!! GERAKAN DIBATALKAN: Koordinat target ({target_x:.1f}, {target_y:.1f}, {target_z:.1f}) di luar batas fisik!")
+        return False
+
+    curr_x, curr_y, curr_z, curr_r = get_current_pose()
+    
+    if not is_transit:
+        if not is_path_safe(curr_x, curr_y, target_x, target_y, r_min=R_MIN_SAFE):
+            print(f"\n   [MITIGASI] Rute lurus ke ({target_x:.1f}, {target_y:.1f}) memotong singularitas!")
+            
+            pull_x = 160.0  
+            pull_y = curr_y
+
+            if curr_x < pull_x:
+                if is_safe(pull_x, pull_y, commanded_safe_z):
+                    print(f"   -> [JEMBATAN 1] Menarik lengan aman ke depan (X:{pull_x}, Y:{pull_y:.1f})")
+                    if not move_to_absolute(pull_x, pull_y, commanded_safe_z, target_r, suck_val, safe_z, is_transit=True):
+                        return False
+                    curr_x, curr_y, curr_z, curr_r = get_current_pose()
+
+            kandidat_transit = [
+                (280.0, 0.0),     
+                (250.0, 200.0),   
+                (250.0, -200.0)   
+            ]
+            
+            rute_aman_ditemukan = False
+            for tx, ty in kandidat_transit:
+                if is_path_safe(curr_x, curr_y, tx, ty) and is_path_safe(tx, ty, target_x, target_y):
+                    print(f"   -> [JEMBATAN 2] Rute penyeberangan aman via ({tx}, {ty})...")
+                    if not move_to_absolute(tx, ty, commanded_safe_z, target_r, suck_val, safe_z, is_transit=True):
+                        return False
+                    rute_aman_ditemukan = True
+                    break
+            
+            if not rute_aman_ditemukan:
+                print("!!! [MITIGASI GAGAL] Tidak ada rute memutar yang aman. Gerakan ke target ini DIBATALKAN.")
+                return False
+                
+            curr_x, curr_y, curr_z, curr_r = get_current_pose()
+
+    fly_z = commanded_safe_z if curr_z < commanded_safe_z else curr_z
+
+    with _alat_lock:
+        if curr_z < commanded_safe_z:
+            controller._set_ptp_cmd(curr_x, curr_y, fly_z, curr_r, mode=PTPMode.MOVL_XYZ.value, wait=False)
+        controller._set_ptp_cmd(target_x, target_y, fly_z, target_r, mode=PTPMode.MOVL_XYZ.value, wait=False)
+        controller._set_ptp_cmd(target_x, target_y, target_z, target_r, mode=PTPMode.MOVL_XYZ.value, wait=False)
+
+    start_time = time.time()
+    while True:
+        try:
+            cx, cy, cz, _ = get_current_pose()
+            jarak_tersisa = math.sqrt((cx - target_x)**2 + (cy - target_y)**2 + (cz - target_z)**2)
+            
+            if jarak_tersisa < 2.5: break
+            if time.time() - start_time > 12.0:
+                print("\n!!! [TIMEOUT] Waktu gerak habis. Kemungkinan macet.")
+                clear_alarms()
+                return False
+        except RuntimeError as e:
+            raise RuntimeError(f"Sensor error di perjalanan (Alarm): {e}")
+        time.sleep(0.1)
+
+    # ====================================================================
+    # PERBAIKAN: Jika transit, abaikan status vakum agar barang tidak jatuh!
+    # ====================================================================
+    if not is_transit:
+        set_suction(_normalize_suck_value(suck_val))
+        time.sleep(SUCTION_SETTLE_DELAY_S)
+        
+    return True
+
+def move_to_target(target_x: float, target_y: float, target_z: Optional[float] = None, target_r: float = 0.0, suck_val: Union[float, bool, int] = 0.0) -> bool:
+    return move_to_absolute(target_x, target_y, target_z, target_r=target_r, suck_val=suck_val)
+
+# ==========================================
+# FUNGSI TAMBAHAN HMI & HOMING
+# ==========================================
+HOME_X, HOME_Y, HOME_Z, HOME_R = 200.0, 0.0, 50.0, 0.0
+
+def reset_home():
+    """Sekuens kalibrasi Homing yang digabung dengan mitigasi aman Pre-Homing."""
+    global device, is_busy
+    if not device: return False
+    
+    if is_busy:
+        print("!!! [HMI-WARNING] Proses sedang berjalan! Abaikan klik tombol berlebih.")
+        return False
+        
+    is_busy = True
+    try:
+        print("\n>>> [MEKANIK] Mempersiapkan Kalibrasi Homing...")
+        clear_alarms()
+        
+        try:
+            cx, cy, cz, cr = get_current_pose()
+            radius = math.sqrt(cx**2 + cy**2)
+            
+            if radius > 260.0 or cz < 0.0:
+                print(f"!!! [WARNING] Posisi pra-homing berbahaya (Radius: {radius:.1f}mm, Z: {cz:.1f}mm)")
+                print(">>> Melipat lengan ke area aman (X:200, Y:0, Z:50) terlebih dahulu...")
+                move_to_absolute(HOME_X, HOME_Y, HOME_Z, HOME_R, suck_val=0.0)
+                print(">>> Posisi aman tercapai. Melanjutkan eksekusi mesin...")
+        except Exception as e:
+            print(f"[WARNING] Gagal membaca pose pra-homing, Homing tetap dilanjutkan. Error: {e}")
+
+        with _alat_lock:
+            print(">>> [MEKANIK] Mengeksekusi Homing Bawaan Mesin! Clear area sekitar Dobot!")
+            _require_device().speed(float(DEFAULT_SPEED_XY), float(DEFAULT_SPEED_Z))
+            time.sleep(0.5)
+            
+            _require_device().home()
+            print(">>> Menunggu ayunan Homing selesai (~20 detik)...")
+            time.sleep(20)
+            print(">>> Homing beres. Mengembalikan ke titik Home Aman...")
+            
+        move_to_absolute(HOME_X, HOME_Y, HOME_Z, HOME_R, suck_val=0.0)
+        return True
+    finally:
+        is_busy = False
+
+def fast_jog(action, step=5.0):
+    global device
+    if not device: return
+    
+    cx, cy, cz, cr = get_current_pose()
+
+    if action == 'maju': cx += step
+    elif action == 'mundur': cx -= step
+    elif action == 'kiri': cy += step
+    elif action == 'kanan': cy -= step
+    elif action == 'atas': cz += step
+    elif action == 'bawah': cz -= step
+    elif action == 'rotate_ccw': cr += step
+    elif action == 'rotate_cw': cr -= step
+    elif action == 'stop':
+        with _alat_lock:
+            device._set_queued_cmd_clear()
+        return
+
+    if is_safe(cx, cy, cz):
+        with _alat_lock:
+            device._set_ptp_cmd(cx, cy, cz, cr, mode=PTPMode.MOVL_XYZ.value, wait=False)
+    else:
+        print("!!! [WARNING] Jog dibatalkan: Mentok batas mekanik.")
+
+def acak_kepingan():
+    print(">>> [MEKANIK] Fungsi Acak Kepingan dipanggil. (Fitur dalam pengembangan).")

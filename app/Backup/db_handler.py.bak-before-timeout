@@ -1,0 +1,211 @@
+import sqlite3
+import random
+from datetime import datetime
+
+DB_NAME = '/home/pi/kodeintegrasi/data/tangram.db'
+DB_LOG_NAME = '/home/pi/kodeintegrasi/data/tangram_logs.db'
+
+BLOCKS = ["BT1", "BT2", "MT", "SQ", "ST1", "ST2", "PL"]
+
+# =========================================================================
+# INTERNAL CORE FUNCTIONS (Database Utama: tangram.db)
+# =========================================================================
+
+def get_pending_target():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT block_name, current_x, current_y, current_r, target_x, target_y, target_r 
+        FROM live_tracking 
+        WHERE status = 'pending' 
+        LIMIT 1
+    """)
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+def has_pending_blocks():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM live_tracking WHERE status = 'pending' LIMIT 1")
+    result = cursor.fetchone() is not None
+    conn.close()
+    return result
+
+def mark_target_completed(block_name):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE live_tracking 
+        SET current_x = target_x, current_y = target_y, current_r = target_r, status = 'idle' 
+        WHERE block_name = ?
+    """, (block_name,))
+    conn.commit()
+    conn.close()
+
+def mark_target_error(block_name):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE live_tracking 
+        SET status = 'error' 
+        WHERE block_name = ?
+    """, (block_name,))
+    conn.commit()
+    conn.close()
+    print(f">>> [DB] Tugas {block_name} dialihkan ke status 'error'. Antrean aman.")
+
+def activate_template(shape_name):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT block_name, target_x, target_y, target_r FROM templates WHERE shape_name = ?", (shape_name,))
+    template_data = cursor.fetchall()
+    
+    if not template_data:
+        print(f"!!! [DB] Template '{shape_name}' tidak ditemukan di database.")
+        conn.close()
+        return
+        
+    for row in template_data:
+        b_name, tx, ty, tr = row
+        cursor.execute("""
+            UPDATE live_tracking 
+            SET target_x = ?, target_y = ?, target_r = ?, status = 'pending'
+            WHERE block_name = ?
+        """, (tx, ty, tr, b_name))
+    
+    cursor.execute("DELETE FROM batch_info")
+    cursor.execute("INSERT INTO batch_info (shape_name, start_time) VALUES (?, ?)",
+                   (shape_name, datetime.now().isoformat()))
+    
+    conn.commit()
+    conn.close()
+    print(f">>> [DB] Template '{shape_name}' siap dieksekusi oleh mesin.")
+
+def get_active_batch():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT shape_name, start_time FROM batch_info LIMIT 1")
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+def clear_active_batch():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM batch_info")
+    conn.commit()
+    conn.close()
+
+def trigger_acak_kepingan():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    batas_x_min, batas_x_max = 140.0, 200.0
+    batas_y_min, batas_y_max = -150.0, 150.0
+
+    for block in BLOCKS:
+        rx = round(random.uniform(batas_x_min, batas_x_max), 1)
+        ry = round(random.uniform(batas_y_min, batas_y_max), 1)
+        rr = round(random.uniform(-90.0, 90.0), 1)
+        
+        cursor.execute("""
+            UPDATE live_tracking 
+            SET target_x = ?, target_y = ?, target_r = ?, status = 'pending'
+            WHERE block_name = ?
+        """, (rx, ry, rr, block))
+        
+    conn.commit()
+    conn.close()
+    print(">>> [DB] Perintah pembongkaran acak berhasil dimasukkan ke antrean core.")
+
+def save_new_template(shape_name, blocks, hint=""):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM templates WHERE shape_name = ?", (shape_name,))
+    for blk in blocks:
+        cursor.execute("""
+            INSERT INTO templates (shape_name, block_name, target_x, target_y, target_r, hint)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (shape_name, blk['block_name'], blk['x'], blk['y'], blk['r'], hint))
+    conn.commit()
+    conn.close()
+    print(f">>> [DB] Desain master '{shape_name}' berhasil direkam.")
+
+def delete_template(shape_name):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM templates WHERE shape_name = ?", (shape_name,))
+    conn.commit()
+    conn.close()
+    print(f">>> [DB] Desain master '{shape_name}' telah dihapus.")
+
+def update_live_tracking_from_vision(vision_blocks):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    try:
+        for blk in vision_blocks:
+            nama = blk.get("block_name")
+            cx = blk.get("x")
+            cy = blk.get("y")
+            cr = blk.get("r")
+            cursor.execute("""
+                UPDATE live_tracking 
+                SET current_x = ?, current_y = ?, current_r = ?
+                WHERE block_name = ?
+            """, (cx, cy, cr, nama))
+        conn.commit()
+        print(f">>> [DB] Sinkronisasi Digital Twin sukses untuk {len(vision_blocks)} kepingan.")
+    except Exception as e:
+        print(f"!!! [DB-ERROR] Gagal sinkronisasi data visi: {e}")
+    finally:
+        conn.close()
+
+
+# =========================================================================
+# ANALYTICS LOGGER FUNCTIONS (Database Historis: tangram_logs.db)
+# =========================================================================
+
+def log_system_event(event_type: str, component: str, message: str):
+    conn = sqlite3.connect(DB_LOG_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO system_event_logs (event_type, component, message)
+            VALUES (?, ?, ?)
+        """, (event_type.upper(), component, message))
+        conn.commit()
+    except Exception as e:
+        print(f"[LOG ERROR] Gagal menulis log sistem: {e}")
+    finally:
+        conn.close()
+
+def log_production_metric(shape_name: str, start_time: str, end_time: str, duration_sec: float, status: str):
+    conn = sqlite3.connect(DB_LOG_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO production_metrics (shape_name, start_time, end_time, duration_sec, status)
+            VALUES (?, ?, ?, ?, ?)
+        """, (shape_name, start_time, end_time, float(duration_sec), status.upper()))
+        conn.commit()
+        print(f">>> [LOG ANALYTICS] Siklus kerja '{shape_name}' tercatat ({duration_sec:.1f} detik, Status: {status})")
+    except Exception as e:
+        print(f"[LOG ERROR] Gagal menulis metrik produksi: {e}")
+    finally:
+        conn.close()
+
+def log_hmi_action(operator_id: str, action: str):
+    conn = sqlite3.connect(DB_LOG_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO hmi_user_logs (operator_id, action)
+            VALUES (?, ?)
+        """, (operator_id, action))
+        conn.commit()
+    except Exception as e:
+        print(f"[LOG ERROR] Gagal menulis log HMI: {e}")
+    finally:
+        conn.close()
